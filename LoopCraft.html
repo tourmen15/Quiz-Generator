@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>LoopCraft</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+    <style>
+        :root {
+            --background-color: #1a1a1a;
+            --foreground-color: #f0f0f0;
+            --glow-color: #ffffff;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: var(--background-color);
+            color: var(--foreground-color);
+            font-family: 'SF Pro Text', 'SF Pro Icons', 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            display: block;
+            flex-shrink: 0;
+        }
+
+        #ui-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 15px 20px;
+            box-sizing: border-box;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 2;
+            font-size: 16px;
+            pointer-events: none;
+            text-shadow: 0 1px 3px #000;
+        }
+        
+        #stats {
+            display: flex;
+            gap: 20px;
+        }
+
+        #controls {
+            display: flex;
+            gap: 10px;
+            pointer-events: all;
+        }
+
+        #controls button {
+            background-color: transparent;
+            border: 1px solid var(--foreground-color);
+            color: var(--foreground-color);
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        #controls button:hover, #controls button:focus {
+            background-color: var(--foreground-color);
+            color: var(--background-color);
+            outline: none;
+        }
+
+        #start-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.7);
+            z-index: 10;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            color: white;
+            font-size: 24px;
+            text-align: center;
+            flex-direction: column;
+        }
+        
+        #start-overlay h1 {
+            margin: 0;
+            padding: 0;
+            font-size: 48px;
+            font-weight: 600;
+        }
+        
+        #start-overlay p {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <div id="stats">
+            <span id="score">Score: 0</span>
+            <span id="grid-size">Grid: 5x5</span>
+        </div>
+        <div id="controls">
+            <button id="restart-btn">Restart</button>
+            <button id="mute-btn">Mute</button>
+        </div>
+    </div>
+    
+    <div id="start-overlay">
+        <div>
+            <h1>LoopCraft</h1>
+            <p>Click or tap to begin</p>
+        </div>
+    </div>
+
+    <canvas id="game-canvas"></canvas>
+
+    <script>
+        // --- Core Game Setup ---
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const scoreEl = document.getElementById('score');
+        const gridSizeEl = document.getElementById('grid-size');
+        const restartBtn = document.getElementById('restart-btn');
+        const muteBtn = document.getElementById('mute-btn');
+        const startOverlay = document.getElementById('start-overlay');
+        
+        // --- Game State & Parameters ---
+        let gameState = {
+            grid: [],
+            gridSize: 5,
+            score: 0,
+            isMuted: false,
+            transitionAlpha: 1,
+            transitionState: 'in', // 'in', 'out', 'none'
+            isSolved: false,
+            lastSolveTime: 0,
+            solveAnimation: {
+                progress: 0,
+                duration: 60, // frames
+                active: false
+            }
+        };
+
+        let cellSize, gridWidth, gridHeight, offsetX, offsetY;
+        
+        // Tile connection masks (4 bits: Up, Right, Down, Left)
+        const TILE_TYPES = {
+            I: 5,  // 0101 (Up, Down)
+            L: 3,  // 0011 (Up, Right)
+        };
+
+        // --- Sound Engine (Tone.js) ---
+        let sounds = {};
+
+        function initializeSounds() {
+            // Ambient Ticking
+            sounds.ambient = new Tone.Loop(time => {
+                sounds.tickSynth.triggerAttackRelease("C2", "32n", time);
+            }, "4n").start(0);
+            sounds.tickSynth = new Tone.MembraneSynth({
+                pitchDecay: 0.01, octaves: 2, envelope: { attack: 0.001, decay: 0.1, sustain: 0 }
+            }).toDestination();
+            sounds.tickSynth.volume.value = -30;
+            
+            // Tile Rotation Click
+            sounds.click = new Tone.MembraneSynth({
+                 pitchDecay: 0.02, octaves: 4, envelope: { attack: 0.001, decay: 0.15, sustain: 0 }
+            }).toDestination();
+            sounds.click.volume.value = -15;
+            
+            // Loop Complete Ring
+            sounds.complete = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.01, decay: 0.5, sustain: 0.1, release: 1 }
+            }).toDestination();
+            const reverb = new Tone.Reverb(1.5).toDestination();
+            sounds.complete.connect(reverb);
+            sounds.complete.volume.value = -10;
+
+            // New Grid Whoosh
+            sounds.whoosh = new Tone.NoiseSynth({
+                noise: { type: "white" },
+                envelope: { attack: 0.01, decay: 0.3, sustain: 0, release: 0.2 }
+            }).toDestination();
+            const filter = new Tone.AutoFilter("4n").toDestination().start();
+            sounds.whoosh.connect(filter);
+            sounds.whoosh.volume.value = -20;
+
+            Tone.Transport.start();
+        }
+        
+        // --- Utility Functions ---
+        function resizeCanvas() {
+            const size = Math.min(window.innerWidth, window.innerHeight) * 0.9;
+            canvas.width = size;
+            canvas.height = size;
+            updateGridDimensions();
+        }
+
+        function updateGridDimensions() {
+            cellSize = canvas.width / gameState.gridSize;
+            gridWidth = canvas.width;
+            gridHeight = canvas.height;
+            offsetX = 0;
+            offsetY = 0;
+        }
+
+        // --- Puzzle Generation ---
+        function generatePuzzle() {
+            gameState.isSolved = false;
+            gameState.grid = [];
+            
+            const size = gameState.gridSize;
+            const solvedGrid = [];
+
+            // 1. Create a graph representation for a maze
+            const nodes = Array(size * size).fill(0).map((_, i) => ({ i, neighbors: [] }));
+            const edges = [];
+            for (let r = 0; r < size; r++) {
+                for (let c = 0; c < size; c++) {
+                    if (r + 1 < size) edges.push([r * size + c, (r + 1) * size + c]);
+                    if (c + 1 < size) edges.push([r * size + c, r * size + c + 1]);
+                }
+            }
+            
+            // 2. Kruskal's algorithm to generate a spanning tree (a maze)
+            // Shuffle edges for randomness
+            for (let i = edges.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [edges[i], edges[j]] = [edges[j], edges[i]];
+            }
+
+            const parent = Array.from(nodes.keys());
+            const find = i => parent[i] === i ? i : (parent[i] = find(parent[i]));
+            const union = (i, j) => {
+                const rootI = find(i);
+                const rootJ = find(j);
+                if (rootI !== rootJ) {
+                    parent[rootI] = rootJ;
+                    return true;
+                }
+                return false;
+            };
+
+            const spanningTreeEdges = [];
+            const extraEdges = [];
+            edges.forEach(edge => {
+                if (union(edge[0], edge[1])) {
+                    spanningTreeEdges.push(edge);
+                } else {
+                    extraEdges.push(edge);
+                }
+            });
+
+            // 3. Add some extra edges back in to create loops
+            const numLoops = Math.floor(size * 1.5);
+            for (let i = 0; i < numLoops && extraEdges.length > 0; i++) {
+                const randIndex = Math.floor(Math.random() * extraEdges.length);
+                spanningTreeEdges.push(extraEdges.splice(randIndex, 1)[0]);
+            }
+
+            spanningTreeEdges.forEach(([u, v]) => {
+                nodes[u].neighbors.push(v);
+                nodes[v].neighbors.push(u);
+            });
+
+            // 4. Convert graph to tile masks
+            for (let r = 0; r < size; r++) {
+                const row = [];
+                for (let c = 0; c < size; c++) {
+                    const i = r * size + c;
+                    const node = nodes[i];
+                    let mask = 0; // U R D L
+                    if (node.neighbors.includes(i - size)) mask |= 8; // Up
+                    if (node.neighbors.includes(i + 1)) mask |= 4;   // Right
+                    if (node.neighbors.includes(i + size)) mask |= 2;   // Down
+                    if (node.neighbors.includes(i - 1)) mask |= 1;   // Left
+                    row.push({ mask });
+                }
+                solvedGrid.push(row);
+            }
+
+            // 5. Scramble the grid by rotating tiles
+            gameState.grid = solvedGrid.map(row => row.map(tile => {
+                const newTile = { ...tile };
+                const rotations = Math.floor(Math.random() * 4);
+                for (let i = 0; i < rotations; i++) {
+                    newTile.mask = ((newTile.mask << 1) | (newTile.mask >> 3)) & 15;
+                }
+                return newTile;
+            }));
+            
+            checkWinState();
+        }
+
+        // --- Game Logic ---
+        function rotateTile(tile) {
+            // Rotate 90 degrees clockwise: (mask << 1 | mask >> 3) & 15
+            tile.mask = ((tile.mask << 1) | (tile.mask >> 3)) & 15;
+        }
+
+        function checkWinState() {
+            const size = gameState.gridSize;
+            for (let r = 0; r < size; r++) {
+                for (let c = 0; c < size; c++) {
+                    const tile = gameState.grid[r][c];
+                    // Check Up
+                    const hasUp = (tile.mask & 8) > 0;
+                    const neighborUp = r > 0 ? (gameState.grid[r - 1][c].mask & 2) > 0 : false;
+                    if (hasUp !== neighborUp) {
+                        gameState.isSolved = false;
+                        return;
+                    }
+                    // Check Left
+                    const hasLeft = (tile.mask & 1) > 0;
+                    const neighborLeft = c > 0 ? (gameState.grid[r][c - 1].mask & 4) > 0 : false;
+                    if (hasLeft !== neighborLeft) {
+                        gameState.isSolved = false;
+                        return;
+                    }
+                }
+            }
+            
+            if (!gameState.isSolved) {
+                onSolve();
+            }
+        }
+        
+        function onSolve() {
+            gameState.isSolved = true;
+            
+            // Score calculation
+            let baseScore = gameState.gridSize * 10;
+            const timeSinceLastSolve = performance.now() - gameState.lastSolveTime;
+            const comboTime = gameState.gridSize * 1500;
+            if (timeSinceLastSolve < comboTime) {
+                baseScore *= 2; // Combo bonus
+            }
+            gameState.score += baseScore;
+            
+            gameState.lastSolveTime = performance.now();
+            scoreEl.textContent = `Score: ${gameState.score}`;
+
+            if (gameState.gridSize < 12) { // Cap grid size
+                gameState.gridSize++;
+            }
+            
+            gameState.solveAnimation.active = true;
+            if (Tone.context.state === 'running') {
+                sounds.complete.triggerAttackRelease("C5", "0.5n");
+            }
+        }
+        
+        function nextPuzzle() {
+            gameState.transitionState = 'out';
+            if (Tone.context.state === 'running') {
+                sounds.whoosh.triggerAttack();
+            }
+        }
+        
+        function update() {
+             if (gameState.solveAnimation.active) {
+                gameState.solveAnimation.progress++;
+                if (gameState.solveAnimation.progress >= gameState.solveAnimation.duration) {
+                    gameState.solveAnimation.active = false;
+                    gameState.solveAnimation.progress = 0;
+                    nextPuzzle();
+                }
+            }
+
+            // Handle transitions
+            if (gameState.transitionState === 'out') {
+                gameState.transitionAlpha += 0.05;
+                if (gameState.transitionAlpha >= 1) {
+                    gameState.transitionAlpha = 1;
+                    gameState.transitionState = 'in';
+                    gridSizeEl.textContent = `Grid: ${gameState.gridSize}x${gameState.gridSize}`;
+                    updateGridDimensions();
+                    generatePuzzle();
+                }
+            } else if (gameState.transitionState === 'in') {
+                gameState.transitionAlpha -= 0.05;
+                if (gameState.transitionAlpha <= 0) {
+                    gameState.transitionAlpha = 0;
+                    gameState.transitionState = 'none';
+                }
+            }
+        }
+
+        // --- Drawing ---
+        function draw() {
+            ctx.fillStyle = '#1a1a1a';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.save();
+            ctx.translate(offsetX, offsetY);
+
+            const halfCell = cellSize / 2;
+            ctx.lineCap = 'round';
+
+            for (let r = 0; r < gameState.gridSize; r++) {
+                for (let c = 0; c < gameState.gridSize; c++) {
+                    const tile = gameState.grid[r][c];
+                    const x = c * cellSize + halfCell;
+                    const y = r * cellSize + halfCell;
+                    
+                    ctx.save();
+                    ctx.translate(x, y);
+
+                    ctx.lineWidth = Math.max(2, cellSize * 0.1);
+                    ctx.strokeStyle = '#f0f0f0';
+                    
+                    if (gameState.solveAnimation.active) {
+                        const progress = gameState.solveAnimation.progress / gameState.solveAnimation.duration;
+                        const glowAlpha = Math.sin(progress * Math.PI);
+                        ctx.shadowColor = `rgba(255, 255, 255, ${glowAlpha})`;
+                        ctx.shadowBlur = 15;
+                    } else {
+                        ctx.shadowColor = 'rgba(255, 255, 255, 0.7)';
+                        ctx.shadowBlur = 5;
+                    }
+                    
+                    // U R D L : 8 4 2 1
+                    ctx.beginPath();
+                    if (tile.mask & 8) { ctx.moveTo(0, 0); ctx.lineTo(0, -halfCell); } // Up
+                    if (tile.mask & 4) { ctx.moveTo(0, 0); ctx.lineTo(halfCell, 0); }  // Right
+                    if (tile.mask & 2) { ctx.moveTo(0, 0); ctx.lineTo(0, halfCell); }   // Down
+                    if (tile.mask & 1) { ctx.moveTo(0, 0); ctx.lineTo(-halfCell, 0); } // Left
+                    ctx.stroke();
+
+                    ctx.restore();
+                }
+            }
+            ctx.restore();
+            
+            // Draw fade transition
+            if (gameState.transitionAlpha > 0) {
+                ctx.globalAlpha = gameState.transitionAlpha;
+                ctx.fillStyle = '#1a1a1a';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        // --- Main Game Loop ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- Event Listeners ---
+        function handleInteraction(e) {
+            if (gameState.isSolved || gameState.transitionState !== 'none') return;
+            
+            const rect = canvas.getBoundingClientRect();
+            const x = (e.clientX || e.touches[0].clientX) - rect.left;
+            const y = (e.clientY || e.touches[0].clientY) - rect.top;
+
+            const c = Math.floor((x - offsetX) / cellSize);
+            const r = Math.floor((y - offsetY) / cellSize);
+
+            if (r >= 0 && r < gameState.gridSize && c >= 0 && c < gameState.gridSize) {
+                rotateTile(gameState.grid[r][c]);
+                if (Tone.context.state === 'running') {
+                    sounds.click.triggerAttackRelease("C3", "16n");
+                }
+                checkWinState();
+            }
+        }
+        
+        function resetGame() {
+            gameState.score = 0;
+            gameState.gridSize = 5;
+            gameState.lastSolveTime = performance.now();
+            scoreEl.textContent = `Score: 0`;
+            gridSizeEl.textContent = `Grid: 5x5`;
+            nextPuzzle();
+        }
+
+        // --- Initialization ---
+        function init() {
+            resizeCanvas();
+
+            startOverlay.addEventListener('click', () => {
+                Tone.start();
+                initializeSounds();
+                startOverlay.style.display = 'none';
+                gameState.lastSolveTime = performance.now();
+                generatePuzzle();
+                requestAnimationFrame(gameLoop);
+            }, { once: true });
+
+            window.addEventListener('resize', resizeCanvas);
+            canvas.addEventListener('click', handleInteraction);
+            canvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                handleInteraction(e);
+            }, { passive: false });
+            
+            restartBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running') return;
+                resetGame();
+            });
+
+            muteBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running') return;
+                gameState.isMuted = !gameState.isMuted;
+                Tone.Master.mute = gameState.isMuted;
+                muteBtn.textContent = gameState.isMuted ? 'Unmute' : 'Mute';
+            });
+        }
+        
+        init();
+    </script>
+</body>
+</html>
