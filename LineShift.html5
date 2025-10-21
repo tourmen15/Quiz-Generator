@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Lineshift</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+    <style>
+        :root {
+            --background-color: #f0f0f0;
+            --foreground-color: #1a1a1a;
+            --highlight-color: #e60000;
+            --glow-color: #ffffff;
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --background-color: #1a1a1a;
+                --foreground-color: #f0f0f0;
+                --highlight-color: #ff4d4d;
+                --glow-color: #ffffff;
+            }
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: var(--background-color);
+            color: var(--foreground-color);
+            font-family: 'SF Pro Text', 'SF Pro Icons', 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        canvas {
+            display: block;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+        }
+
+        #ui-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 15px 20px;
+            box-sizing: border-box;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 2;
+            font-size: 16px;
+            pointer-events: none;
+            text-shadow: 0 1px 3px var(--background-color);
+        }
+
+        #controls {
+            display: flex;
+            gap: 10px;
+            pointer-events: all;
+        }
+
+        #controls button {
+            background-color: transparent;
+            border: 1px solid var(--foreground-color);
+            color: var(--foreground-color);
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        #controls button:hover, #controls button:focus {
+            background-color: var(--foreground-color);
+            color: var(--background-color);
+            outline: none;
+        }
+
+        #start-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+            z-index: 10;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            color: white;
+            font-size: 24px;
+            text-align: center;
+        }
+        
+        #start-overlay h1 {
+            margin: 0;
+            padding: 0;
+            font-size: 48px;
+            font-weight: 600;
+        }
+        
+        #start-overlay p {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <span id="score">Puzzles Solved: 0</span>
+        <div id="controls">
+            <button id="reset-btn">Reset</button>
+            <button id="mute-btn">Mute</button>
+        </div>
+    </div>
+    
+    <div id="start-overlay">
+        <div>
+            <h1>Lineshift</h1>
+            <p>Click or tap to begin untangling</p>
+        </div>
+    </div>
+
+    <canvas id="game-canvas"></canvas>
+
+    <script>
+        // --- Core Game Setup ---
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const scoreEl = document.getElementById('score');
+        const resetBtn = document.getElementById('reset-btn');
+        const muteBtn = document.getElementById('mute-btn');
+        const startOverlay = document.getElementById('start-overlay');
+        
+        // --- Game State & Parameters ---
+        let gameState = {
+            dots: [],
+            lines: [],
+            draggedDot: null,
+            score: 0,
+            dotCount: 4,
+            isSolved: false,
+            isMuted: false,
+            previousIntersectionCount: 0,
+            transitionAlpha: 1,
+            transitionState: 'in', // 'in', 'out', 'none'
+            solveAnimation: {
+                progress: 0,
+                duration: 60, // frames
+                active: false
+            }
+        };
+
+        const DOT_RADIUS = 10;
+        const SPRING_FACTOR = 0.2;
+        const DAMPING_FACTOR = 0.7;
+        const MAX_DOTS = 25;
+        const EDGE_MARGIN = 50;
+        let style;
+
+        // --- Sound Engine (Tone.js) ---
+        let sounds = {};
+
+        function initializeSounds() {
+            // Ambient hum
+            sounds.ambient = new Tone.Loop(time => {
+                sounds.humSynth.triggerAttackRelease("C1", "2n", time);
+            }, "1n").start(0);
+            sounds.humSynth = new Tone.AMSynth({
+                harmonicity: 1.5,
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.01, decay: 0.2, sustain: 0.1, release: 0.5 },
+                modulation: { type: "sawtooth" },
+                modulationEnvelope: { attack: 0.5, decay: 0.01, sustain: 1, release: 0.5 }
+            }).toDestination();
+            sounds.humSynth.volume.value = -35;
+            
+            // Drag sound (white noise)
+            sounds.drag = new Tone.NoiseSynth({
+                noise: { type: "pink" },
+                envelope: { attack: 0.01, decay: 0.1, sustain: 0.1, release: 0.1 }
+            }).toDestination();
+            sounds.drag.volume.value = -25;
+            
+            // Click sound on resolve
+            sounds.click = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.001, decay: 0.1, sustain: 0, release: 0.1 }
+            }).toDestination();
+            sounds.click.volume.value = -15;
+            
+            // Puzzle complete chime
+            sounds.complete = new Tone.PolySynth(Tone.Synth, {
+                oscillator: { type: "triangle" },
+                envelope: { attack: 0.01, decay: 0.5, sustain: 0.2, release: 1 },
+            }).toDestination();
+            const reverb = new Tone.Reverb(2).toDestination();
+            sounds.complete.connect(reverb);
+            sounds.complete.volume.value = -12;
+
+            Tone.Transport.start();
+        }
+        
+        // --- Utility Functions ---
+        const getCssVariable = (varName) => getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+
+        function updateColors() {
+            style = {
+                BACKGROUND: getCssVariable('--background-color'),
+                FOREGROUND: getCssVariable('--foreground-color'),
+                HIGHLIGHT: getCssVariable('--highlight-color'),
+                GLOW: getCssVariable('--glow-color'),
+            }
+        }
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            // On resize, regenerate the puzzle to fit the new screen
+            if (Tone.context.state === 'running') {
+                 generatePuzzle();
+            }
+        }
+
+        // --- Geometric Intersection Logic ---
+        function onSegment(p, q, r) {
+            return (q.x <= Math.max(p.x, r.x) && q.x >= Math.min(p.x, r.x) &&
+                    q.y <= Math.max(p.y, r.y) && q.y >= Math.min(p.y, r.y));
+        }
+
+        function orientation(p, q, r) {
+            const val = (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
+            if (val == 0) return 0; // Collinear
+            return (val > 0) ? 1 : 2; // Clockwise or Counterclockwise
+        }
+
+        function checkIntersection(line1, line2) {
+            // Ignore intersection if lines share a dot
+            if (line1.d1 === line2.d1 || line1.d1 === line2.d2 || line1.d2 === line2.d1 || line1.d2 === line2.d2) {
+                return false;
+            }
+
+            const p1 = line1.d1, q1 = line1.d2;
+            const p2 = line2.d1, q2 = line2.d2;
+
+            const o1 = orientation(p1, q1, p2);
+            const o2 = orientation(p1, q1, q2);
+            const o3 = orientation(p2, q2, p1);
+            const o4 = orientation(p2, q2, q1);
+
+            if (o1 !== o2 && o3 !== o4) {
+                return true;
+            }
+
+            return false;
+        }
+
+        // --- Puzzle Generation ---
+        function generatePuzzle() {
+            gameState.dots = [];
+            gameState.lines = [];
+            gameState.isSolved = false;
+            gameState.solveAnimation.active = false;
+            
+            const numDots = gameState.dotCount;
+
+            // Generate dots in a circle to start, then move them
+            const centerX = canvas.width / 2;
+            const centerY = canvas.height / 2;
+            const radius = Math.min(canvas.width, canvas.height) / 4;
+
+            for (let i = 0; i < numDots; i++) {
+                const angle = (i / numDots) * 2 * Math.PI;
+                gameState.dots.push({
+                    x: centerX + radius * Math.cos(angle),
+                    y: centerY + radius * Math.sin(angle),
+                    vx: 0,
+                    vy: 0,
+                    targetX: 0,
+                    targetY: 0,
+                    isDragging: false
+                });
+            }
+
+            // Create a non-crossing set of lines first (a simple cycle)
+            for (let i = 0; i < numDots; i++) {
+                 gameState.lines.push({ d1: gameState.dots[i], d2: gameState.dots[(i + 1) % numDots] });
+            }
+            // Add extra lines to create tangles
+            const extraLines = Math.floor(numDots / 3);
+            for(let i = 0; i < extraLines; i++) {
+                let d1_idx, d2_idx;
+                let exists = true;
+                while(exists) {
+                    d1_idx = Math.floor(Math.random() * numDots);
+                    d2_idx = Math.floor(Math.random() * numDots);
+                    // Ensure it's not the same dot or an adjacent one
+                    if (d1_idx === d2_idx || Math.abs(d1_idx - d2_idx) <= 1 || Math.abs(d1_idx - d2_idx) === numDots -1) continue;
+                    
+                    const d1 = gameState.dots[d1_idx];
+                    const d2 = gameState.dots[d2_idx];
+
+                    exists = gameState.lines.some(l => 
+                        (l.d1 === d1 && l.d2 === d2) || (l.d1 === d2 && l.d2 === d1)
+                    );
+
+                    if (!exists) {
+                        gameState.lines.push({d1, d2});
+                    }
+                }
+            }
+
+
+            // Tangle the dots by moving them to random positions
+            gameState.dots.forEach(dot => {
+                dot.x = EDGE_MARGIN + Math.random() * (canvas.width - EDGE_MARGIN * 2);
+                dot.y = EDGE_MARGIN + Math.random() * (canvas.height - EDGE_MARGIN * 2);
+            });
+
+            // Ensure the puzzle starts with at least one intersection
+            updateIntersections();
+            if (gameState.previousIntersectionCount === 0 && numDots > 3) {
+                generatePuzzle(); // Retry if it's already solved
+            }
+        }
+        
+        // --- Game Logic Update ---
+        function update() {
+            // Update dot positions with spring physics
+            gameState.dots.forEach(dot => {
+                if (dot.isDragging) {
+                    const dx = dot.targetX - dot.x;
+                    const dy = dot.targetY - dot.y;
+                    dot.vx += dx * SPRING_FACTOR;
+                    dot.vy += dy * SPRING_FACTOR;
+                }
+                dot.vx *= DAMPING_FACTOR;
+                dot.vy *= DAMPING_FACTOR;
+                dot.x += dot.vx;
+                dot.y += dot.vy;
+
+                // Keep dots within bounds
+                dot.x = Math.max(DOT_RADIUS, Math.min(canvas.width - DOT_RADIUS, dot.x));
+                dot.y = Math.max(DOT_RADIUS, Math.min(canvas.height - DOT_RADIUS, dot.y));
+            });
+
+            // Check for intersections
+            if (!gameState.isSolved) {
+                 updateIntersections();
+            }
+
+            // Handle transitions
+            if (gameState.transitionState === 'out') {
+                gameState.transitionAlpha += 0.05;
+                if (gameState.transitionAlpha >= 1) {
+                    gameState.transitionAlpha = 1;
+                    gameState.transitionState = 'in';
+                    generatePuzzle();
+                }
+            } else if (gameState.transitionState === 'in') {
+                gameState.transitionAlpha -= 0.05;
+                if (gameState.transitionAlpha <= 0) {
+                    gameState.transitionAlpha = 0;
+                    gameState.transitionState = 'none';
+                }
+            }
+            
+            // Handle solve animation
+            if (gameState.solveAnimation.active) {
+                gameState.solveAnimation.progress++;
+                if (gameState.solveAnimation.progress >= gameState.solveAnimation.duration) {
+                    gameState.solveAnimation.active = false;
+                    gameState.solveAnimation.progress = 0;
+                    gameState.transitionState = 'out';
+                }
+            }
+        }
+        
+        function updateIntersections() {
+             let currentIntersectionCount = 0;
+            gameState.lines.forEach(line => line.isIntersecting = false);
+
+            for (let i = 0; i < gameState.lines.length; i++) {
+                for (let j = i + 1; j < gameState.lines.length; j++) {
+                    if (checkIntersection(gameState.lines[i], gameState.lines[j])) {
+                        gameState.lines[i].isIntersecting = true;
+                        gameState.lines[j].isIntersecting = true;
+                        currentIntersectionCount++;
+                    }
+                }
+            }
+            
+            // Play click sound if an intersection was just resolved
+            if (currentIntersectionCount < gameState.previousIntersectionCount && Tone.context.state === 'running') {
+                 sounds.click.triggerAttackRelease("C5", "8n");
+            }
+            gameState.previousIntersectionCount = currentIntersectionCount;
+
+            // Check for solved state
+            if (currentIntersectionCount === 0 && !gameState.isSolved) {
+                solvePuzzle();
+            }
+        }
+        
+        function solvePuzzle() {
+            gameState.isSolved = true;
+            gameState.draggedDot = null;
+            gameState.score++;
+            scoreEl.textContent = `Puzzles Solved: ${gameState.score}`;
+
+            if (gameState.dotCount < MAX_DOTS) {
+                gameState.dotCount = 4 + Math.floor(gameState.score / 2);
+            }
+            
+            gameState.solveAnimation.active = true;
+            
+            if (Tone.context.state === 'running') {
+                sounds.complete.triggerAttackRelease(["C4", "E4", "G4", "B4"], "1n");
+            }
+        }
+
+        // --- Drawing ---
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            
+            // Handle solve animation camera pulse
+            if(gameState.solveAnimation.active) {
+                const progress = gameState.solveAnimation.progress / gameState.solveAnimation.duration;
+                const pulse = 1 + Math.sin(progress * Math.PI) * 0.05; // Gentle pulse in and out
+                ctx.translate(canvas.width / 2, canvas.height / 2);
+                ctx.scale(pulse, pulse);
+                ctx.translate(-canvas.width / 2, -canvas.height / 2);
+            }
+
+            // Draw lines
+            gameState.lines.forEach(line => {
+                ctx.beginPath();
+                ctx.setLineDash([5, 5]);
+                ctx.moveTo(line.d1.x, line.d1.y);
+                ctx.lineTo(line.d2.x, line.d2.y);
+                ctx.lineWidth = 2;
+
+                if(gameState.solveAnimation.active) {
+                    ctx.strokeStyle = style.GLOW;
+                    ctx.shadowColor = style.GLOW;
+                    ctx.shadowBlur = 15;
+                    ctx.lineWidth = 4;
+                } else {
+                    ctx.strokeStyle = line.isIntersecting ? style.HIGHLIGHT : style.FOREGROUND;
+                    ctx.shadowBlur = 0;
+                }
+                ctx.stroke();
+                ctx.shadowBlur = 0; // Reset shadow for other elements
+            });
+
+            // Draw dots
+            ctx.setLineDash([]);
+            gameState.dots.forEach(dot => {
+                ctx.beginPath();
+                ctx.arc(dot.x, dot.y, DOT_RADIUS, 0, Math.PI * 2);
+                ctx.fillStyle = style.BACKGROUND;
+                ctx.fill();
+                ctx.strokeStyle = style.FOREGROUND;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            });
+            
+            ctx.restore();
+
+            // Draw fade transition overlay
+            if (gameState.transitionAlpha > 0) {
+                ctx.fillStyle = style.BACKGROUND;
+                ctx.globalAlpha = gameState.transitionAlpha;
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.globalAlpha = 1;
+            }
+        }
+
+        // --- Main Game Loop ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- Event Listeners ---
+        function getEventPos(e) {
+            if (e.touches) {
+                return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+            }
+            return { x: e.clientX, y: e.clientY };
+        }
+
+        function onDown(e) {
+            if (gameState.isSolved) return;
+            const pos = getEventPos(e);
+            
+            for (let i = gameState.dots.length - 1; i >= 0; i--) {
+                const dot = gameState.dots[i];
+                const dx = pos.x - dot.x;
+                const dy = pos.y - dot.y;
+                if (dx * dx + dy * dy < (DOT_RADIUS + 10) * (DOT_RADIUS + 10)) {
+                    gameState.draggedDot = dot;
+                    dot.isDragging = true;
+                    if(Tone.context.state === 'running') sounds.drag.triggerAttack();
+                    break;
+                }
+            }
+        }
+
+        function onMove(e) {
+            if (gameState.draggedDot) {
+                e.preventDefault();
+                const pos = getEventPos(e);
+                gameState.draggedDot.targetX = pos.x;
+                gameState.draggedDot.targetY = pos.y;
+            }
+        }
+
+        function onUp() {
+            if (gameState.draggedDot) {
+                gameState.draggedDot.isDragging = false;
+                gameState.draggedDot = null;
+                if (Tone.context.state === 'running') sounds.drag.triggerRelease();
+            }
+        }
+        
+        // --- Initialization ---
+        function init() {
+            updateColors();
+            resizeCanvas();
+            
+            // Listen for color scheme changes
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', updateColors);
+
+            startOverlay.addEventListener('click', () => {
+                Tone.start();
+                initializeSounds();
+                startOverlay.style.display = 'none';
+                generatePuzzle();
+                requestAnimationFrame(gameLoop);
+            }, { once: true });
+
+            window.addEventListener('resize', resizeCanvas);
+            
+            // Mouse events
+            canvas.addEventListener('mousedown', onDown);
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+
+             // Touch events
+            canvas.addEventListener('touchstart', onDown, { passive: false });
+            window.addEventListener('touchmove', onMove, { passive: false });
+            window.addEventListener('touchend', onUp);
+            
+            // UI Controls
+            resetBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running') return;
+                sounds.click.triggerAttackRelease("A3", "8n");
+                gameState.transitionState = 'out';
+            });
+
+            muteBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running') return;
+                gameState.isMuted = !gameState.isMuted;
+                Tone.Master.mute = gameState.isMuted;
+                muteBtn.textContent = gameState.isMuted ? 'Unmute' : 'Mute';
+            });
+        }
+        
+        init();
+    </script>
+</body>
+</html>
