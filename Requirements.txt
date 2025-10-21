@@ -1,0 +1,9 @@
+Flask==2.1.2
+Flask-Cors==3.0.10
+transformers==4.20.1
+torch==1.12.0
+sentencepiece==0.1.96
+PyPDF2==3.0.1
+python-docx==0.8.11
+python-pptx==0.6.21
+fpdf2==2.5.7
