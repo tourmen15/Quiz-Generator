@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>MindTiles</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.7.77/Tone.js"></script>
+    <style>
+        :root {
+            --background-color: #000000;
+            --foreground-color: #ffffff;
+            --glow-color: #ffffff;
+            --error-color: #ff3b30;
+        }
+
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: var(--background-color);
+            color: var(--foreground-color);
+            font-family: 'SF Pro Display', 'Helvetica Neue', 'Helvetica', 'Arial', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        canvas {
+            display: block;
+            flex-shrink: 0;
+        }
+
+        #ui-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 15px 20px;
+            box-sizing: border-box;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 2;
+            font-size: 16px;
+            pointer-events: none;
+            text-shadow: 0 1px 3px #000;
+        }
+        
+        #stats {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 4px;
+        }
+
+        #controls {
+            display: flex;
+            gap: 10px;
+            pointer-events: all;
+        }
+
+        #controls button {
+            background-color: transparent;
+            border: 1px solid var(--foreground-color);
+            color: var(--foreground-color);
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s ease;
+        }
+        
+        #controls button:hover, #controls button:focus {
+            background-color: var(--foreground-color);
+            color: var(--background-color);
+            outline: none;
+        }
+
+        #start-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.8);
+            z-index: 10;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            color: white;
+            font-size: 24px;
+            text-align: center;
+            flex-direction: column;
+        }
+        
+        #start-overlay h1 {
+            margin: 0;
+            padding: 0;
+            font-size: 48px;
+            font-weight: 600;
+        }
+        
+        #start-overlay p {
+            margin-top: 10px;
+        }
+
+        .score-val {
+            min-width: 50px;
+            display: inline-block;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+    <div id="ui-container">
+        <div id="stats">
+            <span>Score: <span id="score" class="score-val">0</span></span>
+            <span>Best: <span id="best-score" class="score-val">0</span></span>
+        </div>
+        <div id="controls">
+            <button id="restart-btn">Restart</button>
+            <button id="mute-btn">Mute</button>
+        </div>
+    </div>
+    
+    <div id="start-overlay">
+        <div>
+            <h1>MindTiles</h1>
+            <p>Repeat the sequence. Click to begin.</p>
+        </div>
+    </div>
+
+    <canvas id="game-canvas"></canvas>
+
+    <script>
+        // --- Core Game Setup ---
+        const canvas = document.getElementById('game-canvas');
+        const ctx = canvas.getContext('2d');
+        const scoreEl = document.getElementById('score');
+        const bestScoreEl = document.getElementById('best-score');
+        const restartBtn = document.getElementById('restart-btn');
+        const muteBtn = document.getElementById('mute-btn');
+        const startOverlay = document.getElementById('start-overlay');
+        
+        // --- Game State & Parameters ---
+        let gameState = {
+            grid: [],
+            gridSize: 3,
+            sequence: [],
+            playerSequence: [],
+            score: 0,
+            bestScore: localStorage.getItem('mindtiles_best') || 0,
+            streak: 0,
+            isMuted: false,
+            state: 'waiting', // waiting, displaying, player_turn, game_over
+            flashSpeed: 500, // ms between flashes
+            flashDuration: 300, // ms a tile stays lit
+            lastAnimatedScore: 0,
+            errorFlash: 0 // alpha for error effect
+        };
+
+        let cellSize, gridWidth, gridHeight, offsetX, offsetY;
+        const NOTES = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'B4', 'C5', 'D5', 'E5', 'F5', 'G5'];
+
+        // --- Sound Engine (Tone.js) ---
+        let sounds = {};
+
+        function initializeSounds() {
+            // Ambient Pad
+            sounds.ambient = new Tone.Loop(time => {
+                sounds.pad.triggerAttackRelease("C2", "2n", time);
+            }, "1n").start(0);
+            sounds.pad = new Tone.PolySynth(Tone.AMSynth, {
+                harmonicity: 1.5,
+                envelope: { attack: 1, decay: 0.5, sustain: 0.5, release: 2 },
+            }).toDestination();
+            sounds.pad.volume.value = -30;
+
+            // Tile Flash Bell
+            sounds.bell = new Tone.Synth({
+                oscillator: { type: "sine" },
+                envelope: { attack: 0.01, decay: 0.5, sustain: 0.1, release: 0.8 }
+            }).toDestination();
+            sounds.bell.volume.value = -10;
+
+            // Correct Tap Click
+            sounds.click = new Tone.MembraneSynth({
+                 pitchDecay: 0.01, octaves: 6, envelope: { attack: 0.001, decay: 0.1, sustain: 0 }
+            }).toDestination();
+            sounds.click.volume.value = -18;
+            
+            // Wrong Tap Thump
+            sounds.error = new Tone.MembraneSynth({
+                pitchDecay: 0.1, octaves: 2, envelope: { attack: 0.01, decay: 0.3, sustain: 0 }
+            }).toDestination();
+            sounds.error.volume.value = -5;
+
+            // Round Complete Chime
+            sounds.complete = new Tone.PolySynth(Tone.Synth, {
+                oscillator: { type: 'triangle' }
+            }).toDestination();
+            const reverb = new Tone.Reverb(1).toDestination();
+            sounds.complete.connect(reverb);
+            sounds.complete.volume.value = -15;
+
+            Tone.Transport.start();
+        }
+        
+        // --- Utility Functions ---
+        function resizeCanvas() {
+            const size = Math.min(window.innerWidth, window.innerHeight) * 0.8;
+            canvas.width = size;
+            canvas.height = size;
+            updateGridDimensions();
+            createGrid();
+        }
+
+        function updateGridDimensions() {
+            cellSize = canvas.width / gameState.gridSize;
+        }
+
+        // --- Grid and Puzzle ---
+        function createGrid() {
+            gameState.grid = [];
+            for (let r = 0; r < gameState.gridSize; r++) {
+                for (let c = 0; c < gameState.gridSize; c++) {
+                    gameState.grid.push({
+                        x: c * cellSize,
+                        y: r * cellSize,
+                        flashAlpha: 0
+                    });
+                }
+            }
+        }
+
+        function flashTile(index) {
+            if (index < 0 || index >= gameState.grid.length) return;
+            gameState.grid[index].flashAlpha = 1;
+
+            if (Tone.context.state === 'running') {
+                const noteIndex = gameState.sequence.indexOf(index);
+                const note = NOTES[noteIndex % NOTES.length];
+                sounds.bell.triggerAttackRelease(note, "8n");
+            }
+        }
+        
+        // --- Game Logic Flow ---
+        function startGame() {
+            gameState.score = 0;
+            gameState.lastAnimatedScore = 0;
+            gameState.streak = 0;
+            gameState.sequence = [];
+            gameState.gridSize = 3;
+            gameState.flashSpeed = 500;
+            updateGridDimensions();
+            createGrid();
+            setTimeout(nextRound, 500);
+        }
+
+        function nextRound() {
+            gameState.state = 'displaying';
+            gameState.playerSequence = [];
+            
+            // Level up grid and speed
+            if (gameState.sequence.length === 5 && gameState.gridSize < 5) {
+                gameState.gridSize++;
+                updateGridDimensions();
+                createGrid();
+            }
+            if (gameState.sequence.length > 0 && gameState.sequence.length % 4 === 0) {
+                 gameState.flashSpeed = Math.max(150, gameState.flashSpeed * 0.9);
+            }
+
+            const newTileIndex = Math.floor(Math.random() * (gameState.gridSize * gameState.gridSize));
+            gameState.sequence.push(newTileIndex);
+            
+            if (Tone.context.state === 'running' && gameState.sequence.length > 1) {
+                sounds.complete.triggerAttackRelease(['C5', 'E5', 'G5'], '4n');
+            }
+
+            displaySequence();
+        }
+
+        function displaySequence() {
+            gameState.state = 'displaying';
+            let i = 0;
+            const interval = setInterval(() => {
+                if (i < gameState.sequence.length) {
+                    flashTile(gameState.sequence[i]);
+                    i++;
+                } else {
+                    clearInterval(interval);
+                    gameState.state = 'player_turn';
+                }
+            }, gameState.flashSpeed);
+        }
+
+        function handlePlayerInput(x, y) {
+            if (gameState.state !== 'player_turn') return;
+
+            const c = Math.floor(x / cellSize);
+            const r = Math.floor(y / cellSize);
+            const index = r * gameState.gridSize + c;
+
+            if (index >= 0 && index < gameState.grid.length) {
+                const currentStep = gameState.playerSequence.length;
+                
+                if (gameState.sequence[currentStep] === index) {
+                    // Correct tap
+                    if (Tone.context.state === 'running') sounds.click.triggerAttackRelease('C4', '16n');
+                    flashTile(index);
+                    gameState.playerSequence.push(index);
+
+                    gameState.streak++;
+                    const multiplier = Math.floor(gameState.streak / 5) + 1;
+                    gameState.score += 1 * multiplier;
+
+                    if (gameState.playerSequence.length === gameState.sequence.length) {
+                        // Round complete
+                        setTimeout(nextRound, 700);
+                    }
+                } else {
+                    // Incorrect tap
+                    if (Tone.context.state === 'running') sounds.error.triggerAttackRelease('C2', '8n');
+                    gameState.errorFlash = 1.0;
+                    gameState.streak = 0;
+                    // Reset and replay sequence
+                    gameState.state = 'game_over';
+                    setTimeout(() => {
+                        gameState.playerSequence = [];
+                        displaySequence();
+                    }, 1000);
+                }
+            }
+        }
+        
+        // --- Update and Draw ---
+        function update() {
+            let changed = false;
+            // Animate tile flashes
+            gameState.grid.forEach(tile => {
+                if (tile.flashAlpha > 0) {
+                    tile.flashAlpha -= (1000 / 60) / gameState.flashDuration; // fade over duration
+                    if(tile.flashAlpha < 0) tile.flashAlpha = 0;
+                    changed = true;
+                }
+            });
+
+            // Animate error flash
+            if(gameState.errorFlash > 0) {
+                gameState.errorFlash -= 0.05;
+                if(gameState.errorFlash < 0) gameState.errorFlash = 0;
+                changed = true;
+            }
+
+            // Animate score
+            if (gameState.lastAnimatedScore < gameState.score) {
+                 gameState.lastAnimatedScore = Math.ceil(gameState.lastAnimatedScore + (gameState.score - gameState.lastAnimatedScore) * 0.1);
+                 scoreEl.textContent = gameState.lastAnimatedScore;
+            }
+            if (gameState.score > gameState.bestScore) {
+                gameState.bestScore = gameState.score;
+                localStorage.setItem('mindtiles_best', gameState.bestScore);
+            }
+            bestScoreEl.textContent = gameState.bestScore;
+        }
+
+        function draw() {
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Draw tiles
+            gameState.grid.forEach((tile) => {
+                if (tile.flashAlpha > 0) {
+                    ctx.fillStyle = `rgba(255, 255, 255, ${tile.flashAlpha})`;
+                    ctx.shadowColor = '#ffffff';
+                    ctx.shadowBlur = 20;
+                    ctx.fillRect(tile.x, tile.y, cellSize, cellSize);
+                    ctx.shadowBlur = 0;
+                }
+            });
+
+            // Draw grid lines
+            ctx.strokeStyle = '#333333';
+            ctx.lineWidth = 2;
+            for (let i = 1; i < gameState.gridSize; i++) {
+                // Vertical
+                ctx.beginPath();
+                ctx.moveTo(i * cellSize, 0);
+                ctx.lineTo(i * cellSize, canvas.height);
+                ctx.stroke();
+                // Horizontal
+                ctx.beginPath();
+                ctx.moveTo(0, i * cellSize);
+                ctx.lineTo(canvas.width, i * cellSize);
+                ctx.stroke();
+            }
+
+            // Draw error overlay
+            if(gameState.errorFlash > 0) {
+                ctx.fillStyle = `rgba(255, 59, 48, ${gameState.errorFlash * 0.5})`;
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+            }
+        }
+
+        // --- Main Game Loop ---
+        function gameLoop() {
+            update();
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- Event Listeners ---
+        function handleInteraction(e) {
+            const rect = canvas.getBoundingClientRect();
+            const x = (e.clientX || e.touches[0].clientX) - rect.left;
+            const y = (e.clientY || e.touches[0].clientY) - rect.top;
+            handlePlayerInput(x, y);
+        }
+
+        // --- Initialization ---
+        function init() {
+            bestScoreEl.textContent = gameState.bestScore;
+            resizeCanvas();
+
+            startOverlay.addEventListener('click', () => {
+                Tone.start();
+                initializeSounds();
+                startOverlay.style.display = 'none';
+                startGame();
+                requestAnimationFrame(gameLoop);
+            }, { once: true });
+
+            window.addEventListener('resize', resizeCanvas);
+            canvas.addEventListener('click', handleInteraction);
+            canvas.addEventListener('touchstart', (e) => {
+                e.preventDefault();
+                handleInteraction(e);
+            }, { passive: false });
+            
+            restartBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running' || gameState.state === 'displaying') return;
+                startGame();
+            });
+
+            muteBtn.addEventListener('click', () => {
+                if(Tone.context.state !== 'running') return;
+                gameState.isMuted = !gameState.isMuted;
+                Tone.Master.mute = gameState.isMuted;
+                muteBtn.textContent = gameState.isMuted ? 'Unmute' : 'Mute';
+            });
+        }
+        
+        init();
+    </script></body>
+</html>
